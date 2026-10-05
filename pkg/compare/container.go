@@ -23,6 +23,7 @@ import (
 const (
 	containerScheme      = "container://"
 	containerPathDivider = ":/"
+	maskedContainerImage = "<masked>"
 	registryReadTimeout  = 5 * time.Minute
 )
 
@@ -240,7 +241,7 @@ func (reader registryReader) extract(
 	ctx, cancel := context.WithTimeout(ctx, registryReadTimeout)
 	defer cancel()
 
-	klog.V(1).Infof("Downloading container image %q", reference.image.Name())
+	klog.V(1).Infof("Downloading container image %q", maskedContainerImage)
 	image, err := reader.pull(ctx, reference.image, reader.keychain, reader.platform)
 	if err != nil {
 		return "", err
@@ -266,7 +267,7 @@ func (reader registryReader) extract(
 	if err := reader.apply(ctx, image, staging, reference.metadataPath, reader.limits); err != nil {
 		return "", err
 	}
-	klog.V(1).Infof("Successfully downloaded container image %q", reference.image.Name())
+	klog.V(1).Infof("Successfully downloaded container image %q", maskedContainerImage)
 
 	finalPath := strings.TrimSuffix(staging, ".partial")
 	if _, err := reader.lstat(finalPath); !errors.Is(err, os.ErrNotExist) {
@@ -279,7 +280,7 @@ func (reader registryReader) extract(
 		return "", fmt.Errorf("publishing extracted reference: %w", err)
 	}
 	published = true
-	klog.V(1).Infof("Extracted container reference from image %q to %q", reference.image.Name(), finalPath)
+	klog.V(1).Infof("Extracted container reference from image %q to %q", maskedContainerImage, finalPath)
 	return finalPath, nil
 }
 
