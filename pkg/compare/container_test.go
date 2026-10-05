@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -38,6 +39,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/klog/v2"
 )
 
 const credentialHelperModeEnv = "KUBE_COMPARE_TEST_CREDENTIAL_HELPER"
@@ -82,6 +84,26 @@ func runCredentialHelperProcess(mode string) {
 		os.Exit(2)
 	}
 	os.Exit(0)
+}
+
+func captureKlogOutput(t *testing.T, verbosity string, operation func() error) (string, error) {
+	t.Helper()
+	flags := flag.NewFlagSet("capture-klog", flag.ContinueOnError)
+	klog.InitFlags(flags)
+	require.NoError(t, flags.Set("v", verbosity))
+
+	var output bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&output)
+	defer func() {
+		require.NoError(t, flags.Set("v", "0"))
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+
+	operationErr := operation()
+	klog.Flush()
+	return output.String(), operationErr
 }
 
 func TestIsContainer(t *testing.T) {
@@ -1388,6 +1410,174 @@ func TestRegistryReaderWiringAndCleanup(t *testing.T) {
 		require.NoError(t, readErr)
 		assert.Empty(t, entries)
 	})
+}
+
+func TestRegistryReaderVerboseDownloadLogs(t *testing.T) {
+	reference, err := parsePath("container://example/ref:v1:/ref/metadata.yaml")
+	require.NoError(t, err)
+	lower := uncompressedLayer(t,
+		tarEntry{name: "ref/metadata.yaml", contents: "lower"},
+		tarEntry{name: "ref/lower.yaml", contents: "lower"},
+	)
+	upper := uncompressedLayer(t,
+		tarEntry{name: "ref/metadata.yaml", contents: "upper"},
+		tarEntry{name: "ref/upper.yaml", contents: "upper"},
+	)
+	image := imageFromLayers(t, lower, upper)
+	lowerSize, err := lower.Size()
+	require.NoError(t, err)
+	upperSize, err := upper.Size()
+	require.NoError(t, err)
+
+	newReader := func() registryReader {
+		reader := newRegistryReader()
+		reader.limits = testLimits()
+		reader.pull = func(context.Context, name.Reference, authn.Keychain, v1.Platform) (v1.Image, error) {
+			return image, nil
+		}
+		return reader
+	}
+
+	t.Run("verbosity zero is silent", func(t *testing.T) {
+		reader := newReader()
+		logs, extractErr := captureKlogOutput(t, "0", func() error {
+			_, err := reader.extract(context.Background(), reference, t.TempDir())
+			return err
+		})
+		require.NoError(t, extractErr)
+		assert.Empty(t, logs)
+	})
+
+	t.Run("verbosity one reports ordered bounded progress", func(t *testing.T) {
+		reader := newReader()
+		var destination string
+		logs, extractErr := captureKlogOutput(t, "1", func() error {
+			var err error
+			destination, err = reader.extract(context.Background(), reference, t.TempDir())
+			return err
+		})
+		require.NoError(t, extractErr)
+
+		expected := []string{
+			fmt.Sprintf("Downloading container image %q", reference.image.Name()),
+			fmt.Sprintf("Downloading container image layer 1/2 (%d declared compressed bytes)", upperSize),
+			fmt.Sprintf("Downloaded container image layer 1/2 (%d compressed bytes; %d total compressed bytes)", upperSize, upperSize),
+			fmt.Sprintf("Downloading container image layer 2/2 (%d declared compressed bytes)", lowerSize),
+			fmt.Sprintf("Downloaded container image layer 2/2 (%d compressed bytes; %d total compressed bytes)", lowerSize, upperSize+lowerSize),
+			fmt.Sprintf("Successfully downloaded container image %q", reference.image.Name()),
+			fmt.Sprintf("Extracted container reference from image %q to %q", reference.image.Name(), destination),
+		}
+		previous := -1
+		for _, message := range expected {
+			position := strings.Index(logs, message)
+			require.Greater(t, position, previous, "missing or out-of-order log message %q in %s", message, logs)
+			previous = position
+		}
+	})
+}
+
+func TestRegistryReaderVerboseLogsDoNotReportPrematureCompletion(t *testing.T) {
+	reference, err := parsePath("container://example/ref:v1:/ref/metadata.yaml")
+	require.NoError(t, err)
+	validLayer := uncompressedLayer(t, tarEntry{name: "ref/metadata.yaml", contents: "metadata"})
+	validImage := imageFromLayers(t, validLayer)
+
+	t.Run("layer verification failure", func(t *testing.T) {
+		verificationErr := errors.New("verification failed")
+		image := layersOverrideImage{
+			Image: validImage,
+			layers: []v1.Layer{
+				compressedErrorLayer{Layer: validLayer, err: verificationErr},
+			},
+		}
+		reader := newRegistryReader()
+		reader.limits = testLimits()
+		reader.pull = func(context.Context, name.Reference, authn.Keychain, v1.Platform) (v1.Image, error) {
+			return image, nil
+		}
+		logs, extractErr := captureKlogOutput(t, "1", func() error {
+			_, err := reader.extract(context.Background(), reference, t.TempDir())
+			return err
+		})
+		assert.ErrorIs(t, extractErr, verificationErr)
+		assert.Contains(t, logs, "Downloading container image layer 1/1")
+		assert.NotContains(t, logs, "Downloaded container image layer 1/1")
+		assert.NotContains(t, logs, "Successfully downloaded container image")
+		assert.NotContains(t, logs, "Extracted container reference")
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		reader := newRegistryReader()
+		reader.limits = testLimits()
+		reader.pull = func(context.Context, name.Reference, authn.Keychain, v1.Platform) (v1.Image, error) {
+			return validImage, nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		logs, extractErr := captureKlogOutput(t, "1", func() error {
+			_, err := reader.extract(ctx, reference, t.TempDir())
+			return err
+		})
+		assert.ErrorIs(t, extractErr, context.Canceled)
+		assert.NotContains(t, logs, "Downloaded container image layer")
+		assert.NotContains(t, logs, "Successfully downloaded container image")
+		assert.NotContains(t, logs, "Extracted container reference")
+	})
+
+	t.Run("publication failure omits destination", func(t *testing.T) {
+		publishErr := errors.New("publish failed")
+		reader := newRegistryReader()
+		reader.limits = testLimits()
+		reader.pull = func(context.Context, name.Reference, authn.Keychain, v1.Platform) (v1.Image, error) {
+			return validImage, nil
+		}
+		reader.publish = func(string, string) error { return publishErr }
+		logs, extractErr := captureKlogOutput(t, "1", func() error {
+			_, err := reader.extract(context.Background(), reference, t.TempDir())
+			return err
+		})
+		assert.ErrorIs(t, extractErr, publishErr)
+		assert.Contains(t, logs, fmt.Sprintf("Successfully downloaded container image %q", reference.image.Name()))
+		assert.NotContains(t, logs, "Extracted container reference")
+	})
+}
+
+func TestContainerVerboseLogsQuoteTrustedValuesAndRedactRawInput(t *testing.T) {
+	const secret = "verbose-log-secret-sentinel"
+	logs, err := captureKlogOutput(t, "1", func() error {
+		_, err := getReferencesFromContainer(
+			context.Background(),
+			"container://user:"+secret+"@registry.example/ref:/metadata.yaml",
+			t.TempDir(),
+		)
+		return err
+	})
+	require.Error(t, err)
+	assert.Empty(t, logs)
+	assert.NotContains(t, logs, secret)
+	assert.NotContains(t, logs, "user:")
+
+	reference, err := parsePath("container://example/ref:v1:/ref/metadata.yaml")
+	require.NoError(t, err)
+	root := filepath.Join(t.TempDir(), "destination\ncontrol")
+	require.NoError(t, os.Mkdir(root, 0o700))
+	reader := newRegistryReader()
+	reader.pull = func(context.Context, name.Reference, authn.Keychain, v1.Platform) (v1.Image, error) {
+		return empty.Image, nil
+	}
+	reader.apply = func(_ context.Context, _ v1.Image, staging, _ string, _ extractionLimits) error {
+		return os.WriteFile(filepath.Join(staging, "metadata.yaml"), []byte("ok"), 0o600)
+	}
+	var destination string
+	logs, err = captureKlogOutput(t, "1", func() error {
+		var extractErr error
+		destination, extractErr = reader.extract(context.Background(), reference, root)
+		return extractErr
+	})
+	require.NoError(t, err)
+	assert.Contains(t, logs, fmt.Sprintf("Downloading container image %q", reference.image.Name()))
+	assert.Contains(t, logs, fmt.Sprintf("to %q", destination))
+	assert.NotContains(t, logs, destination)
 }
 
 func TestRegistryReaderRejectsInvalidTempRootBeforePull(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/klauspost/compress/zstd"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -198,6 +199,14 @@ func applyImageLayers(
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("applying image context: %w", err)
 		}
+		layerNumber := len(layers) - layerIndex
+		klog.V(1).Infof(
+			"Downloading container image layer %d/%d (%d declared compressed bytes)",
+			layerNumber,
+			len(layers),
+			manifest.Layers[layerIndex].Size,
+		)
+		compressedBefore := compressedBudget.used
 		if err := applyImageLayer(
 			ctx,
 			layers[layerIndex],
@@ -211,6 +220,13 @@ func applyImageLayers(
 		); err != nil {
 			return fmt.Errorf("applying image layer %d: %w", layerIndex, err)
 		}
+		klog.V(1).Infof(
+			"Downloaded container image layer %d/%d (%d compressed bytes; %d total compressed bytes)",
+			layerNumber,
+			len(layers),
+			compressedBudget.used-compressedBefore,
+			compressedBudget.used,
+		)
 	}
 
 	metadataInfo, err := extractionRoot.Lstat(selected.metadataName)
